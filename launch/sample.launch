@@ -1,0 +1,20 @@
+<launch>
+
+<!-- Publish PCL using : -->
+<!-- rosrun pcl_ros pcd_to_pointcloud <pcl_file_name>.pcd 0.1 _frame_id:=/map -->
+
+<!-- Launch RViz with the demo configuration -->
+<node name="rviz" pkg="rviz" type="rviz"
+  args="-d $(find rrt_pcl_ros)/config/standalone.rviz"
+  />
+
+<node pkg="rrt_pcl_ros" type="rrt_pcl_ros_node" name="rrt_pcl_ros_node" output="screen">
+  <rosparam command="load" file="$(find rrt_pcl_ros)/config/standalone.yaml" />
+  <remap from="/pcl" to="/cloud_pcd"/>
+</node>
+
+<node pkg="rrt_pcl_ros" type="rrt_pcl_ros_visualization" name="rrt_pcl_ros_visualization" output="screen">
+  <rosparam command="load" file="$(find rrt_pcl_ros)/config/standalone.yaml" />
+</node>
+
+</launch>
