@@ -1,0 +1,8 @@
+is_using_formation: true
+is_circle_formation: false
+runtime_error: 10.0
+circle_radius: 2.5
+number_of_runs: 10
+
+start_position: [0.0, 0.0, 1.5]
+end_position: [13.0, 0.0, 1.5]

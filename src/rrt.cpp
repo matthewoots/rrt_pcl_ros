@@ -36,6 +36,7 @@
 #include <pcl/conversions.h>
 
 #include "rrt_pcl_ros/point_array.h"
+#include <std_msgs/Float32MultiArray.h>
 
 #define KNRM  "\033[0m"
 #define KRED  "\033[31m"
@@ -46,29 +47,30 @@
 #define KCYN  "\033[36m"
 #define KWHT  "\033[37m"
 
+#define check_size 3
+#define param_size 10
+
 using namespace std;
 // using namespace rrt_helper;
 
 std::vector<Vector3d> rrt_path;
-double _step_size;
-double _obs_threshold;
+double _step_size, _obs_threshold, _xybuffer, _zbuffer, _min_height, _max_height, _passage_size, _timeout, _scale_z;
+int _max_tries, _number_of_runs;
 
-double _xybuffer, _zbuffer;
-
-double _min_height, _max_height;
-double _passage_size;
-
-int _max_tries;
-double _timeout;
-double _scale_z;
-
-bool pcl_received;
+bool message_check[check_size] = {false, false, false};
+bool _is_using_formation, _is_circle_formation;
+double _circle_radius, _runtime_error;
+vector<double> formation_param, solo_param;
 
 double yaw;
 Vector3d translation;
-pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_pc1(new pcl::PointCloud<pcl::PointXYZ>);;
+pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_pc1(new pcl::PointCloud<pcl::PointXYZ>);
 
 std::vector<Vector3d> bspline;
+
+vector<bool> runtime_success;
+vector<double> runtime_average;
+double final_run_time;
 
 class simple_node
 {
@@ -76,10 +78,11 @@ private:
 
     ros::NodeHandle _nh;
     ros::Publisher rrt_pub;
-    ros::Subscriber pcl_sub;
+    ros::Subscriber pcl_sub, formation_msg_sub, solo_msg_sub, pcl2_msg_sub;
 
     // For debug
     ros::Publisher altered_pcl_pub, bs_pub;
+    
 
 public:
     sensor_msgs::PointCloud2 pcl_pc2;
@@ -87,18 +90,30 @@ public:
 
     simple_node(ros::NodeHandle &nodeHandle)
     {
+        /* ------------ Subscribe from swarm param ------------ */
+        /** 
+        * @brief Handles formation parameters from float64 array
+        */
+        formation_msg_sub = _nh.subscribe<std_msgs::Float32MultiArray>(
+            "/param/formation_settings", 1, &simple_node::formationParamMsgCallBack, this);
+        /** 
+        * @brief Handles solo parameters from float64 array
+        */
+        solo_msg_sub = _nh.subscribe<std_msgs::Float32MultiArray>(
+            "/param/solo_settings", 1, &simple_node::soloParamMsgCallBack, this);
+        pcl2_msg_sub = _nh.subscribe<sensor_msgs::PointCloud2>(
+            "/param/pcl", 1,  boost::bind(&simple_node::pcl2MsgCallBack, this, _1));
+
         /** 
         * @brief Publisher of rrt points
         */
         rrt_pub = _nh.advertise<rrt_pcl_ros::point_array>("/rrt", 10);
 
-        pcl_sub = _nh.subscribe("/pcl", 1, &simple_node::pcl2_callback, this);
-        // pcl_sub = _nh.subscribe("/pcl", 1, simple_node::pcl2_callback);
-        printf("%s[rrt.cpp] Constructor Setup Ready! \n", KGRN);
-
-        // For debug
+        /** For debug */
         altered_pcl_pub = _nh.advertise<sensor_msgs::PointCloud2>("/query_pcl", 10);
         bs_pub = _nh.advertise<rrt_pcl_ros::point_array>("/bs", 10);
+
+        printf("%s[rrt.cpp] Constructor Setup Ready! \n", KGRN);
     }
     ~simple_node(){};
 
@@ -116,10 +131,38 @@ public:
         rrt_pub.publish(msg);
     }
 
-    void pcl2_callback(const sensor_msgs::PointCloud2ConstPtr& msg)
+    void pcl2MsgCallBack(const sensor_msgs::PointCloud2ConstPtr& msg)
     {
         pcl_pc2 = *msg;
-        pcl_received = true;
+        message_check[0] = true;
+        printf("%s[rrt.cpp] PCL Param Msg received! \n", KGRN);
+    }
+    /** @brief Handles formation parameters from float64 array */
+    void formationParamMsgCallBack(const  std_msgs::Float32MultiArray::ConstPtr &msg)
+    {
+        std_msgs::Float32MultiArray multi_array = *msg;
+        
+        formation_param.clear();
+        for (int i = 0; i < multi_array.data.size(); i++)
+        {
+            formation_param.push_back((double)multi_array.data[i]);
+        }
+        message_check[1] = true;
+        printf("%s[rrt.cpp] RRT Formation Param Msg received! \n", KGRN);
+    }
+
+    /** @brief Handles solo parameters from float64 array */
+    void soloParamMsgCallBack(const  std_msgs::Float32MultiArray::ConstPtr &msg)
+    {
+        std_msgs::Float32MultiArray multi_array = *msg;
+        
+        solo_param.clear();
+        for (int i = 0; i < multi_array.data.size(); i++)
+        {
+            solo_param.push_back((double)multi_array.data[i]);
+        }
+        message_check[2] = true;
+        printf("%s[rrt.cpp] RRT Solo Param Msg received! \n", KGRN);
     }
 
     void query_pcl_publisher(pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_pc,
@@ -152,11 +195,32 @@ public:
     }
 };
 
+bool initialize_rrt_params(vector<double> params)
+{
+    if (params.size() != param_size)
+        return false;
+
+    _step_size = params[0];
+    _obs_threshold = params[1];
+    _xybuffer = params[2];
+    _zbuffer = params[3];
+    _passage_size = params[4];
+
+    _min_height = params[5];
+    _max_height = params[6];
+    _max_tries = params[7];
+    _timeout = params[8];
+    _scale_z = params[9];
+
+    return true;
+}
 
 
-bool RRT(sensor_msgs::PointCloud2 pcl_pc, 
+bool run_rrt(sensor_msgs::PointCloud2 pcl_pc, 
     Vector3d start, Vector3d end, vector<VectorXd> no_fly_zone)
 {
+    final_run_time = -1.0;
+    double start_time = ros::Time::now().toSec();
     rrt_path.clear();
 
     pcl::PointCloud<pcl::PointXYZ>::Ptr original_pcl_pc = 
@@ -261,7 +325,10 @@ bool RRT(sensor_msgs::PointCloud2 pcl_pc,
     rrt_node rrt;
     rrt.error = true;
     int rrt_tries = 0;
-    while (rrt_tries < _max_tries && rrt.process_status())
+
+    double prev = ros::Time::now().toSec();
+    
+    while (ros::Time::now().toSec() - prev < _runtime_error && rrt.process_status())
     {
         // Use for transformed start and end in transformed frame
         rrt.initialize(t_t_start, t_t_end, transformed_cropped_pc,
@@ -327,6 +394,8 @@ bool RRT(sensor_msgs::PointCloud2 pcl_pc,
     // Now the whole path is flipped, hence we need to flip it back in bspline
 
     rrt_path = path;
+
+    final_run_time = ros::Time::now().toSec() - start_time;
     
     // create_bspline(_bs_order, end, start);
     return true;
@@ -379,58 +448,51 @@ int main(int argc, char **argv)
     simple_node simple_node(_nh);
     
     // ROS Params
-    _nh.param<double>("step_size", _step_size, 1.0);
-    _nh.param<double>("obs_threshold", _obs_threshold, 1.0);
-    _nh.param<double>("xybuffer", _xybuffer, 1.0);
-    _nh.param<double>("zbuffer", _zbuffer, 1.0);
-    _nh.param<double>("passage_size", _passage_size, 1.0);
+    _nh.param<bool>("is_using_formation", _is_using_formation, false); 
+    _nh.param<bool>("is_circle_formation", _is_circle_formation, false); 
+    _nh.param<double>("runtime_error", _runtime_error, 10.0); 
+    _nh.param<double>("circle_radius", _circle_radius, 1.0); 
+    _nh.param<int>("number_of_runs", _number_of_runs, 10); 
 
-    _nh.param<double>("min_height", _min_height, 1.0);
-    _nh.param<double>("max_height", _max_height, 1.0);
-    _nh.param<int>("max_tries", _max_tries, 1.0);
-    _nh.param<double>("timeout", _timeout, 0.1);
-    _nh.param<double>("z_scale", _scale_z, 1.0);
+    std::vector<double> start_list, end_list;
+    Vector3d start, end;
+    double sum = 0;
+    _nh.getParam("start_position", start_list);
+    _nh.getParam("end_position", end_list);
+    for(unsigned i = 0; i < start_list.size(); i++) 
+    {
+      start((int)i) = start_list[(int)i];
+      end((int)i) = end_list[(int)i];
+    }
+
+    printf("%s[rrt.cpp] start and end positions [%lf %lf %lf] [%lf %lf %lf]\n", KGRN, 
+        start.x(), start.y(), start.z(), end.x(), end.y(), end.z());
     
-    // *** For DEBUG ***
+    int rrt_run_count = 0;
     
-
-
     while (ros::ok())
     {
-        if (pcl_received)
+        int status_pass = 0;
+        for (int i = 0; i < check_size; i++)
+        {
+            if (message_check[i])
+                status_pass++;
+        }
+        
+        if (status_pass == check_size)
         {
             // x_min, x_max, y_min, y_max
             vector<VectorXd> no_fly_zone;
+            
 
-            // Wall
-            // Vector3d start = Vector3d(0,0,1.5);
-            // Vector3d end = Vector3d(12,0,1.5);
+            vector<double> rrt_params;
+            if (_is_using_formation)
+                rrt_params = formation_param;
+            else
+                rrt_params = solo_param;
+            initialize_rrt_params(rrt_params);
 
-            // Pole
-            Vector3d start = Vector3d(13,-2.5,1.5);
-            Vector3d end = Vector3d(27.5,-2.5,1.5);
-
-            VectorXd a(4); 
-            a(0) = 15.0; a(1) =  25.0; a(2) = -5.0; a(3) = -1.6;
-            no_fly_zone.push_back(a);
-            a(0) = 15.0; a(1) =  25.0; a(2) = 1.6; a(3) = 5.0;
-            no_fly_zone.push_back(a);
-
-
-            // Square Hoops
-            // Vector3d start = Vector3d(31,0,1.5);
-            // Vector3d end = Vector3d(30,-8,1.5);
-
-            // Circle Hoops
-            // Vector3d start = Vector3d(22.5,-10,1.5);
-            // Vector3d end = Vector3d(17.5,-10,1.5);
-
-            // Triangle Hoops
-            // Vector3d start = Vector3d(12.5,-10,1.5);
-            // Vector3d end = Vector3d(7.5,-12,1.5);
-
-
-            if (RRT(simple_node.pcl_pc2, start, end, no_fly_zone))
+            if (run_rrt(simple_node.pcl_pc2, start, end, no_fly_zone))
             {
                 rrt_bspline(3);
                 printf("%s[rrt.cpp] RRT Succeeded\n", KGRN);
@@ -439,14 +501,72 @@ int main(int argc, char **argv)
                 simple_node.path_message_wrapper_publisher();
                 simple_node.query_pcl_publisher(transformed_pc1, yaw, translation);
                 simple_node.bspline_publisher();
+
+                // Log down time if successful
+                runtime_success.push_back(true);
             }
             else
-                return 0;
-        }
+                runtime_success.push_back(false);
 
+            runtime_average.push_back(final_run_time);
+
+            rrt_run_count++;
+        }
         ros::spinOnce();
-        ros::Duration(1.5).sleep();
+
+        if (rrt_run_count == _number_of_runs)
+        {
+            int passes = 0;
+            double avg_runtime = 0.0;
+            for (int i = 0; i < _number_of_runs; i++)
+            {
+                if (runtime_success[i])
+                {
+                    passes++;
+                    avg_runtime += runtime_average[i];
+                }
+            }
+            avg_runtime = avg_runtime / passes;
+
+            printf("%s------------- Results ------------- \n", KYEL);
+            printf("%s  %d runs [success %d / %d]\n", KCYN, _number_of_runs, passes, _number_of_runs);
+            printf("%s  Average runtime %lf \n", KCYN, avg_runtime);
+
+            return 0;
+        }
+        // ros::Duration(1.5).sleep();
     }
 
     return 0;
 }
+
+/** @brief Competition waypoints */
+// x_min, x_max, y_min, y_max
+// vector<VectorXd> no_fly_zone;
+
+// Wall
+// Vector3d start = Vector3d(0,0,1.5);
+// Vector3d end = Vector3d(13,0,1.5);
+
+// Pole
+// Vector3d start = Vector3d(13,-2.5,1.5);
+// Vector3d end = Vector3d(27.5,-2.5,1.5);
+
+// VectorXd a(4); 
+// a(0) = 15.0; a(1) =  25.0; a(2) = -5.0; a(3) = -1.6;
+// no_fly_zone.push_back(a);
+// a(0) = 15.0; a(1) =  25.0; a(2) = 1.6; a(3) = 5.0;
+// no_fly_zone.push_back(a);
+
+
+// Square Hoops
+// Vector3d start = Vector3d(31,0,1.5);
+// Vector3d end = Vector3d(30,-8,1.5);
+
+// Circle Hoops
+// Vector3d start = Vector3d(22.5,-10,1.5);
+// Vector3d end = Vector3d(17.5,-10,1.5);
+
+// Triangle Hoops
+// Vector3d start = Vector3d(12.5,-10,1.5);
+// Vector3d end = Vector3d(7.5,-12,1.5);

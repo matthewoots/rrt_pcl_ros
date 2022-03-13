@@ -42,13 +42,22 @@
 #include <geometry_msgs/Point.h>
 
 #include "rrt_pcl_ros/point_array.h"
+#include <std_msgs/Float32MultiArray.h>
+
+#define check_size 2
 
 using namespace std;
 using namespace Eigen;
 
 ros::Publisher rrt_marker_pub, bs_marker_pub;
 ros::Publisher ellipsoid_marker_pub;
-ros::Subscriber bs_message, rrt_message;
+ros::Subscriber bs_message, rrt_message, solo_msg_sub, formation_msg_sub;
+
+vector<double> formation_param, solo_param;
+
+bool _is_using_formation;
+
+bool message_check[check_size] = {false, false};
 
 double _obs_threshold, _scale_z;
 
@@ -171,6 +180,48 @@ void bs_callback(const rrt_pcl_ros::point_array::ConstPtr &msg)
   bs_marker_pub.publish(line_strip);
 }
 
+/** @brief Handles formation parameters from float64 array */
+void formationParamMsgCallBack(const  std_msgs::Float32MultiArray::ConstPtr &msg)
+{
+    std_msgs::Float32MultiArray multi_array = *msg;
+    
+    formation_param.clear();
+    for (int i = 0; i < multi_array.data.size(); i++)
+    {
+        formation_param.push_back((double)multi_array.data[i]);
+    }
+    message_check[0] = true;
+    printf("%s[viz.cpp] RRT Formation Param Msg received! \n", KGRN);
+}
+
+/** @brief Handles solo parameters from float64 array */
+void soloParamMsgCallBack(const  std_msgs::Float32MultiArray::ConstPtr &msg)
+{
+    std_msgs::Float32MultiArray multi_array = *msg;
+    
+    solo_param.clear();
+    for (int i = 0; i < multi_array.data.size(); i++)
+    {
+        solo_param.push_back((double)multi_array.data[i]);
+    }
+    message_check[1] = true;
+    printf("%s[viz.cpp] RRT Solo Param Msg received! \n", KGRN);
+}
+
+void update_param()
+{
+  if (_is_using_formation)
+  {
+    _obs_threshold = formation_param[1];
+    _scale_z = formation_param[9];
+  }
+  else
+  {
+    _obs_threshold = solo_param[1];
+    _scale_z = solo_param[9];
+  }
+}
+
 
 int main( int argc, char** argv )
 {
@@ -179,8 +230,7 @@ int main( int argc, char** argv )
   ros::init(argc, argv, "rrt_pcl_ros_visualization");
   ros::NodeHandle n("~");
 
-  n.param<double>("obs_threshold", _obs_threshold, 1.0);
-  n.param<double>("z_scale", _scale_z, 1.0);
+  n.param<bool>("is_using_formation", _is_using_formation, false);
 
   bs_marker_pub = n.advertise<visualization_msgs::Marker>(
         "/bs_visualization_marker", 10);
@@ -193,11 +243,34 @@ int main( int argc, char** argv )
         "/bs", 10, &bs_callback);      
   rrt_message = n.subscribe<rrt_pcl_ros::point_array>(
         "/rrt", 10, &rrt_callback);
+  /** 
+  * @brief Handles solo parameters from float64 array
+  */
+  solo_msg_sub = n.subscribe<std_msgs::Float32MultiArray>(
+      "/param/solo_settings",10,  &soloParamMsgCallBack);
+  /** 
+  * @brief Handles formation parameters from float64 array
+  */
+  formation_msg_sub = n.subscribe<std_msgs::Float32MultiArray>(
+      "/param/formation_settings", 10, &formationParamMsgCallBack);
 
   ros::Rate r(rate);
 
-  ros::spin();
+  while (ros::ok())
+  {
+    int status_pass = 0;
+    for (int i = 0; i < check_size; i++)
+    {
+        if (message_check[i])
+            status_pass++;
+    }
+    
+    if (status_pass == check_size)
+      update_param();
 
+    ros::spinOnce();
+    ros::Duration(rate).sleep();
+  }
   return 0;
 }
 
